@@ -1,8 +1,10 @@
 # tag_updater.py
 
 import os
+import subprocess
 import time
 import argparse
+from typing import Counter
 import mutagen
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
@@ -52,57 +54,125 @@ def extract_song_info(api_result: dict) -> dict or None:
     except (IndexError, KeyError, TypeError):
         return None
 
+def find_most_common_result(results: list) -> dict or None:
+    """
+    从一个结果列表中，通过对每个标签（标题、艺术家、专辑）独立投票，
+    合成并返回最可靠的结果。
+
+    Args:
+        results (list): 一个包含多个歌曲信息字典的列表。
+
+    Returns:
+        dict: 包含了最可靠的 'title', 'artist', 'album' 的字典。
+    """
+    if not results:
+        return None
+
+    # 创建三个列表，分别存放所有识别到的标题、艺术家和专辑
+    titles = [info.get('title') for info in results if info.get('title')]
+    artists = [info.get('artist') for info in results if info.get('artist')]
+    albums = [info.get('album') for info in results if info.get('album')]
+
+    final_result = {}
+    print("    [独立投票结果]")
+
+    # 1. 对标题进行投票
+    if titles:
+        title_counter = Counter(titles)
+        best_title, count = title_counter.most_common(1)[0]
+        final_result['title'] = best_title
+        print(f"      -> 最佳标题: '{best_title}' (出现 {count} 次)")
+    
+    # 2. 对艺术家进行投票
+    if artists:
+        artist_counter = Counter(artists)
+        best_artist, count = artist_counter.most_common(1)[0]
+        final_result['artist'] = best_artist
+        print(f"      -> 最佳艺术家: '{best_artist}' (出现 {count} 次)")
+        
+    # 3. 对专辑进行投票
+    if albums:
+        album_counter = Counter(albums)
+        best_album, count = album_counter.most_common(1)[0]
+        final_result['album'] = best_album
+        print(f"      -> 最佳专辑: '{best_album}' (出现 {count} 次)")
+
+    return final_result if final_result else None
+
+def get_audio_duration(file_path: str) -> float or None:
+    """
+    使用 ffprobe (首选) 或 mutagen (备用) 来获取音频文件的时长。
+    ffprobe 更可靠，能处理更多格式。
+    """
+    # 优先尝试 ffprobe
+    try:
+        command = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            file_path
+        ]
+        # 设置 subprocess.DEVNULL 来隐藏 ffmpeg 的额外输出
+        process = subprocess.run(command, capture_output=True, text=True, check=True, stderr=subprocess.DEVNULL)
+        return float(process.stdout.strip())
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+        # 如果 ffprobe 失败 (未安装或文件问题)，则回退到 mutagen
+        try:
+            audio = mutagen.File(file_path)
+            if audio and hasattr(audio, 'info'):
+                return audio.info.length
+        except Exception:
+            return None
+    return None
 
 def recognize_song(file_path: str, num_segments: int = 3) -> dict or None:
     """
-    通过音频指纹识别歌曲信息，可尝试多个时间点以提高成功率。
-
-    Args:
-        file_path (str): 音频文件路径。
-        num_segments (int): 尝试识别的次数（分段数）。
-
-    Returns:
-        dict: 包含识别到的歌曲信息的字典，或 None。
+    通过音频指纹识别歌曲信息，执行所有分段并根据投票结果确定最佳匹配。
+    (已增强时长获取逻辑，更健壮)
     """
-    print(f"[*] 正在识别: {os.path.basename(file_path)} (尝试 {num_segments} 个分段)")
+    print(f"[*] 正在识别: {os.path.basename(file_path)} (执行全部 {num_segments} 个分段进行投票)")
+    
+    # 使用新的、更可靠的函数获取时长
+    duration = get_audio_duration(file_path)
 
-    try:
-        audio = mutagen.File(file_path)
-        if not audio or not hasattr(audio, 'info') or audio.info.length < FINGERPRINT_DURATION:
-            # 如果文件太短或无法读取时长，只尝试从头开始
-            start_times = [0]
-        else:
-            duration = audio.info.length
-            # 动态计算采样点，使其均匀分布在音频的 10% 到 90% 之间
-            # 避免采样文件开头和结尾的静音部分
-            if num_segments == 1:
-                start_times = [int(duration * 0.3)]  # 如果只采一次，取 30% 位置
-            else:
-                padding = 0.1  # 距离开头和结尾的距离
-                effective_duration = duration * (1 - 2 * padding)
-                interval = effective_duration / (num_segments - 1) if num_segments > 1 else 0
-                start_times = [int(duration * padding + i * interval) for i in range(num_segments)]
-
-    except Exception:
-        # 如果无法获取时长，使用默认列表
+    # --- 基于获取到的时长计算采样点 ---
+    if duration is None or duration < FINGERPRINT_DURATION:
+        # 如果两种方法都无法获取时长，或文件太短，则使用默认方案
+        print("[!] 警告: 无法获取音频时长，将使用默认采样点 [0, 30, 60]s。")
         start_times = [0, 30, 60][:num_segments]
+    else:
+        # 正常的、我们期望的逻辑
+        if num_segments == 1:
+            start_times = [int(duration * 0.3)]
+        else:
+            padding = 0.1
+            # 确保有效时长不会因短文件而变为负数
+            effective_duration = max(0, duration * (1 - 2 * padding))
+            # 确保 interval 计算不会因 num_segments=1 而除以零
+            interval = effective_duration / (num_segments - 1) if num_segments > 1 else 0
+            start_times = [int(duration * padding + i * interval) for i in range(num_segments)]
 
-    for offset in start_times:
+    # --- 后续的循环和投票逻辑保持不变 ---
+    all_successful_results = []
+    
+    for i, offset in enumerate(start_times):
+        print(f"    -> 正在分析分段 {i+1}/{num_segments} (从 {offset}s 开始)")
         try:
             fp = generate_fingerprint_from_file(file_path, start_time=offset)
             result = GetMatchTrackByFP(fp, FINGERPRINT_DURATION)
-
             song_info = extract_song_info(result)
+            
             if song_info:
-                print(f"[+] 在 {offset}s 处成功匹配！")
-                return song_info
-
-            time.sleep(0.5)  # 短暂等待，避免过于频繁的 API 请求
+                print(f"    [+] 在 {offset}s 处匹配到: {song_info.get('title', '未知')}")
+                all_successful_results.append(song_info)
+            else:
+                print(f"    [-] 在 {offset}s 处未匹配到结果。")
+            time.sleep(0.5)
         except Exception as e:
-            print(f"[!] 匹配失败 (偏移 {offset}s): {str(e)[:100]}...")  # 打印简短的错误信息
+            print(f"    [!] 分段 {i+1} 失败: {str(e)[:100]}...")
 
-    return None
-
+    return find_most_common_result(all_successful_results)
 
 def update_metadata(file_path: str, song_info: dict, tags_to_write: list):
     """
