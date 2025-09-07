@@ -1,5 +1,3 @@
-# tag_updater.py
-
 import os
 import subprocess
 import time
@@ -102,7 +100,6 @@ def find_most_common_result(results: list) -> dict or None:
 def get_audio_duration(file_path: str) -> float or None:
     """
     使用 ffprobe (首选) 或 mutagen (备用) 来获取音频文件的时长。
-    ffprobe 更可靠，能处理更多格式。
     """
     # 优先尝试 ffprobe
     try:
@@ -129,37 +126,50 @@ def get_audio_duration(file_path: str) -> float or None:
 def recognize_song(file_path: str, num_segments: int = 3) -> dict or None:
     """
     通过音频指纹识别歌曲信息，执行所有分段并根据投票结果确定最佳匹配。
-    (已增强时长获取逻辑，更健壮)
     """
-    print(f"[*] 正在识别: {os.path.basename(file_path)} (执行全部 {num_segments} 个分段进行投票)")
+    print(f"[*] 正在识别: {os.path.basename(file_path)} (执行 {num_segments} 个分段进行投票)")
     
-    # 使用新的、更可靠的函数获取时长
     duration = get_audio_duration(file_path)
 
-    # --- 基于获取到的时长计算采样点 ---
-    if duration is None or duration < FINGERPRINT_DURATION:
-        # 如果两种方法都无法获取时长，或文件太短，则使用默认方案
-        print("[!] 警告: 无法获取音频时长，将使用默认采样点 [0, 30, 60]s。")
-        start_times = [0, 30, 60][:num_segments]
+    start_times = []
+    if duration is None:
+        # 情况1: 无法获取时长。使用固定间隔生成回退采样点。
+        fallback_interval = 30  # 假设每隔30秒采样一次
+        start_times = [i * fallback_interval for i in range(num_segments)]
+        print(f"[!] 警告: 无法获取音频时长。将使用固定的 {fallback_interval}s 间隔生成采样点: {start_times}s。")
+
+    elif duration < FINGERPRINT_DURATION:
+        # 情况2: 时长已知，但太短无法生成完整指纹。
+        # 仅从头开始尝试一次，因为没有其他有效的采样点。
+        start_times = [0]
+        print(f"[!] 警告: 音频时长 ({duration:.1f}s) 短于指纹所需时长 ({FINGERPRINT_DURATION}s)。将仅从 0s 处尝试识别一次。")
+
     else:
-        # 正常的、我们期望的逻辑
+        # 情况3: 时长正常，按比例计算采样点。
         if num_segments == 1:
+            # 对于单次采样，选择一个靠前但不是最开头的位置
             start_times = [int(duration * 0.3)]
         else:
-            padding = 0.1
-            # 确保有效时长不会因短文件而变为负数
-            effective_duration = max(0, duration * (1 - 2 * padding))
-            # 确保 interval 计算不会因 num_segments=1 而除以零
-            interval = effective_duration / (num_segments - 1) if num_segments > 1 else 0
-            start_times = [int(duration * padding + i * interval) for i in range(num_segments)]
+            # 确保最后一个采样点之后仍有足够的时间来生成一个完整的指纹
+            # 有效的采样窗口是从 0 到 (duration - FINGERPRINT_DURATION)
+            valid_window_end = max(0, duration - FINGERPRINT_DURATION)
+            
+            # 在这个有效窗口内均匀分布采样点
+            # 避免 num_segments=1 时除以零
+            interval = valid_window_end / (num_segments - 1) if num_segments > 1 else 0
+            start_times = [int(i * interval) for i in range(num_segments)]
 
-    # --- 后续的循环和投票逻辑保持不变 ---
     all_successful_results = []
     
+    # 确保只对有效的采样点进行循环
     for i, offset in enumerate(start_times):
-        print(f"    -> 正在分析分段 {i+1}/{num_segments} (从 {offset}s 开始)")
+        print(f"    -> 正在分析分段 {i+1}/{len(start_times)} (从 {offset}s 开始)")
         try:
             fp = generate_fingerprint_from_file(file_path, start_time=offset)
+            if not fp:
+                print(f"    [!] 在 {offset}s 处无法生成指纹 (可能已到文件末尾)。")
+                continue # 如果无法生成指纹，跳到下一个点
+
             result = GetMatchTrackByFP(fp, FINGERPRINT_DURATION)
             song_info = extract_song_info(result)
             
@@ -217,14 +227,42 @@ def update_metadata(file_path: str, song_info: dict, tags_to_write: list):
             audio['album'] = song_info['album']
             updated_tags.append(f"专辑: {song_info['album']}")
 
-        audio.save()
-        print(f"    新标签 -> {', '.join(updated_tags)}")
+        if updated_tags:
+            audio.save()
+            print(f"    新标签 -> {', '.join(updated_tags)}")
+        else:
+            print("    [i] 没有需要更新的标签。")
 
     except Exception as e:
         print(f"[!] 写入元数据失败: {e}")
 
+# --- 检查文件是否已有完整标签 ---
+def has_complete_tags(file_path: str) -> bool:
+    """
+    检查一个音频文件是否已经包含 'title', 'artist', 'album' 三个非空标签。
+    
+    Args:
+        file_path (str): 音频文件路径。
 
-def process_path(path: str, num_segments: int, tags_to_write: list):
+    Returns:
+        bool: 如果三个标签都存在且不为空，则返回 True，否则返回 False。
+    """
+    try:
+        audio = mutagen.File(file_path, easy=True)
+        if audio is None or audio.tags is None:
+            return False
+        
+        # 检查三个关键标签是否存在且内容不为空白
+        title = audio.get('title', [''])[0].strip()
+        artist = audio.get('artist', [''])[0].strip()
+        album = audio.get('album', [''])[0].strip()
+        
+        return bool(title and artist and album)
+    except Exception:
+        # 如果读取文件时发生任何错误，都认为它没有完整标签
+        return False
+
+def process_path(path: str, num_segments: int, tags_to_write: list, force_update: bool):
     """
     处理指定的路径，可以是单个文件或整个文件夹。
     """
@@ -246,8 +284,16 @@ def process_path(path: str, num_segments: int, tags_to_write: list):
     total_files = len(files_to_process)
     print(f"找到 {total_files} 个支持的音频文件。")
 
+    skipped_count = 0
     for i, file_path in enumerate(files_to_process):
-        print(f"\n--- [{i + 1}/{total_files}] 处理中 ---")
+        print(f"\n--- [{i + 1}/{total_files}] 处理文件: {os.path.basename(file_path)} ---")
+
+        # 检查是否需要跳过
+        if not force_update and has_complete_tags(file_path):
+            print("[i] 文件已有完整标签，跳过。(可使用 --force 强制更新)")
+            skipped_count += 1
+            continue
+
         song_info = recognize_song(file_path, num_segments)
 
         if song_info:
@@ -255,6 +301,9 @@ def process_path(path: str, num_segments: int, tags_to_write: list):
         else:
             print("[x] 未能找到匹配的歌曲信息，跳过写入。")
 
+    # 在结束时提供一个总结
+    if skipped_count > 0:
+        print(f"\n--- 跳过了 {skipped_count} 个已有完整标签的文件。 ---")
 
 def main():
     """
@@ -268,11 +317,17 @@ def main():
   # 处理单个文件，尝试 5 次识别，写入所有标签
   python tag_updater.py "C:\\Music\\song.mp3" -n 5
 
-  # 处理整个文件夹，使用默认 3 次识别，只写入标题和艺术家
+  # 处理整个文件夹，使用默认 1 次识别，只写入标题和艺术家
   python tag_updater.py "D:\\My Music" -t title artist
 
   # 处理文件夹，并为每个文件尝试 10 次识别以提高准确率
   python tag_updater.py "/path/to/folder" --segments 10
+  
+  # 处理文件夹，但强制更新所有文件，即便是已有完整标签的文件
+  python tag_updater.py "/path/to/folder" --force
+  
+  # 组合使用：强制更新并尝试 5 次识别
+  python tag_updater.py "/path/to/folder" -n 5 -f
 """
     )
 
@@ -284,8 +339,8 @@ def main():
     parser.add_argument(
         "-n", "--segments",
         type=int,
-        default=3,
-        help="每个文件尝试识别的次数（分段数）。增加此值可提高识别成功率，但会花费更长时间。 (默认: 3)"
+        default=1,
+        help="每个文件尝试识别的次数（分段数）。增加此值可提高识别成功率，但会花费更长时间。 (默认: 1)"
     )
     parser.add_argument(
         "-t", "--tags",
@@ -294,10 +349,17 @@ def main():
         default=['title', 'artist', 'album'],
         help="指定要写入的元数据标签。可以选择 'title', 'artist', 'album' 中的一个或多个。 (默认: 写入全部三个)"
     )
+    # 新增的命令行参数
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="强制更新所有文件的标签，即使文件已有完整的标题、艺术家和专辑信息。"
+    )
 
     args = parser.parse_args()
 
-    process_path(args.path, args.segments, args.tags)
+    # 将新增的 force 参数传递给处理函数
+    process_path(args.path, args.segments, args.tags, args.force)
     print("\n--- 所有任务处理完成！ ---")
 
 
