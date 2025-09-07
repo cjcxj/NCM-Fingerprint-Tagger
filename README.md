@@ -1,4 +1,4 @@
-# [NCM-Fingerprint-Tagger]
+# NCM-Fingerprint-Tagger
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 
