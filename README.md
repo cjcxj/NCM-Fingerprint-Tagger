@@ -26,8 +26,8 @@ A powerful command-line tool to automatically identify local music files using a
 
 1.  克隆本仓库:
     ```bash
-    git clone https://github.com/your-username/[NCM-Fingerprint-Tagger].git
-    cd [NCM-Fingerprint-Tagger]
+    git clone https://github.com/cjcxj/NCM-Fingerprint-Tagger.git
+    cd NCM-Fingerprint-Tagger
     ```
 
 2.  安装 Python 依赖:
